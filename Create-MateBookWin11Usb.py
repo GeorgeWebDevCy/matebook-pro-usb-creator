@@ -476,40 +476,103 @@ def extract_driver_installers_with_7zip(
     on_progress: callable | None,
     percent: int,
 ) -> Path:
-    exe_files = sorted(
-        [path for path in source_root.rglob("*") if path.is_file() and path.suffix.lower() == ".exe"],
+    archive_extensions = {".exe", ".cab", ".zip", ".7z", ".msi", ".rar"}
+    max_depth = 8
+
+    initial_archives = sorted(
+        [path for path in source_root.rglob("*") if path.is_file() and path.suffix.lower() in archive_extensions],
         key=lambda path: str(path).lower(),
     )
-    if not exe_files:
-        raise RuntimeError("No .exe installers were found to extract with 7-Zip.")
+    if not initial_archives:
+        raise RuntimeError("No archive/installers were found to extract with 7-Zip.")
 
     extraction_root = destination_root / "exe_extracted"
     extraction_root.mkdir(parents=True, exist_ok=True)
     write_stage(
         percent=percent,
-        message=f"Found {len(exe_files)} installer EXE file(s). Attempting 7-Zip extraction...",
+        message=(
+            f"Found {len(initial_archives)} archive/installer file(s). "
+            "Running recursive 7-Zip extraction..."
+        ),
         on_progress=on_progress,
     )
-    log_info(f"Using 7-Zip at {seven_zip_path} to extract {len(exe_files)} EXE installer(s).")
+    log_info(
+        f"Using 7-Zip at {seven_zip_path} for recursive payload extraction. "
+        f"Initial archive count: {len(initial_archives)}."
+    )
 
-    for index, exe_path in enumerate(exe_files, start=1):
-        relative_exe = exe_path.relative_to(source_root)
-        destination_folder = extraction_root / relative_exe.parent / exe_path.stem
+    # Queue holds (path_to_archive, recursion_depth).
+    queue: list[tuple[Path, int]] = [(path, 1) for path in initial_archives]
+    processed: set[str] = set()
+    extracted_count = 0
+    failed_count = 0
+
+    while queue:
+        archive_path, depth = queue.pop(0)
+        archive_key = str(archive_path).lower()
+        if archive_key in processed:
+            continue
+        processed.add(archive_key)
+
+        if depth > max_depth:
+            continue
+
+        try:
+            relative_archive = archive_path.relative_to(source_root)
+        except ValueError:
+            relative_archive = archive_path.relative_to(extraction_root)
+
+        destination_folder = extraction_root / relative_archive.parent / f"{archive_path.stem}_x"
         destination_folder.mkdir(parents=True, exist_ok=True)
 
         write_stage(
             percent=percent,
-            message=f"7-Zip extracting installer [{index}/{len(exe_files)}]: {relative_exe}",
+            message=(
+                f"7-Zip extracting depth {depth} ({extracted_count + 1}): {relative_archive}"
+            ),
             on_progress=on_progress,
         )
 
-        run_command(
-            seven_zip_path,
-            ["x", "-y", f"-o{destination_folder}", str(exe_path)],
-            error_message=f"Failed to extract installer with 7-Zip: {exe_path}",
-            accept_exit_codes={0},
-        )
+        try:
+            run_command(
+                seven_zip_path,
+                ["x", "-y", f"-o{destination_folder}", str(archive_path)],
+                error_message=f"Failed to extract archive with 7-Zip: {archive_path}",
+                accept_exit_codes={0, 1},
+            )
+            extracted_count += 1
+        except Exception:
+            failed_count += 1
+            log_exception(f"7-Zip extraction failed for: {archive_path}")
+            write_stage(
+                percent=percent,
+                message=f"7-Zip skipped unsupported archive: {relative_archive}",
+                on_progress=on_progress,
+            )
+            continue
 
+        nested_archives = sorted(
+            [path for path in destination_folder.rglob("*") if path.is_file() and path.suffix.lower() in archive_extensions],
+            key=lambda path: str(path).lower(),
+        )
+        for nested_archive in nested_archives:
+            nested_key = str(nested_archive).lower()
+            if nested_key not in processed:
+                queue.append((nested_archive, depth + 1))
+
+    inf_count = len(list(extraction_root.rglob("*.inf")))
+    write_stage(
+        percent=percent,
+        message=(
+            f"7-Zip recursive extraction completed: extracted={extracted_count}, "
+            f"skipped={failed_count}, inf_found={inf_count}"
+        ),
+        on_progress=on_progress,
+    )
+    log_info(
+        f"7-Zip recursive extraction finished. extracted={extracted_count}, "
+        f"skipped={failed_count}, inf_found={inf_count}"
+    )
     return extraction_root
 
 
@@ -720,10 +783,11 @@ def add_drivers_to_wim(
                 on_progress=on_progress,
             )
 
-            run_command(
+            add_driver_result = run_command(
                 "dism.exe",
                 [f"/Image:{mount_dir}", "/Add-Driver", f"/Driver:{drivers_path}", "/Recurse"],
                 error_message=f"{label} index {image_index} driver injection failed",
+                accept_exit_codes={0, 2},
                 on_output_line=lambda line: write_command_output(
                     line=line,
                     percent=before_percent,
@@ -731,6 +795,18 @@ def add_drivers_to_wim(
                     on_progress=on_progress,
                 ),
             )
+            if add_driver_result.exit_code == 2:
+                write_stage(
+                    percent=before_percent,
+                    message=(
+                        f"{label}[{image_index}] DISM reported partial add-driver errors (exit code 2). "
+                        "Continuing with successfully installed drivers."
+                    ),
+                    on_progress=on_progress,
+                )
+                log_info(
+                    f"{label} index {image_index} Add-Driver returned exit code 2; continuing with partial success."
+                )
 
             after_drivers = get_image_third_party_drivers(mount_dir)
             added_drivers = [
@@ -984,28 +1060,6 @@ def dismount_iso(iso_path: str) -> None:
     )
 
 
-def export_online_drivers(*, destination_root: Path, on_progress: callable | None, percent: int) -> Path:
-    export_path = destination_root / "online_exported_drivers"
-    export_path.mkdir(parents=True, exist_ok=True)
-    write_stage(
-        percent=percent,
-        message=f"Exporting installed drivers from current Windows into: {export_path}",
-        on_progress=on_progress,
-    )
-    run_command(
-        "dism.exe",
-        ["/Online", "/Export-Driver", f"/Destination:{export_path}"],
-        error_message="Failed to export currently installed drivers from this system",
-        on_output_line=lambda line: write_command_output(
-            line=line,
-            percent=percent,
-            prefix="Online export: ",
-            on_progress=on_progress,
-        ),
-    )
-    return export_path
-
-
 def invoke_usb_creation(
     *,
     iso_path: str,
@@ -1018,7 +1072,6 @@ def invoke_usb_creation(
     mounted_iso = False
     extracted_drivers_root: Path | None = None
     extracted_installers_root: Path | None = None
-    exported_online_drivers_root: Path | None = None
     iso_file = Path(iso_path)
     work_root = Path(tempfile.mkdtemp(prefix="MateBookUsbCreator_"))
     mount_dir = work_root / "Mount"
@@ -1071,24 +1124,10 @@ def invoke_usb_creation(
                     )
                     repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
                 else:
-                    write_stage(
-                        percent=4,
-                        message=(
-                            "Driver packages are installer EXEs and 7-Zip was not found. "
-                            "Falling back to exporting installed drivers from this Windows system..."
-                        ),
-                        on_progress=on_progress,
+                    raise RuntimeError(
+                        "Driver packages are installer EXEs (no INF files yet), and 7-Zip is not available. "
+                        "Install 7-Zip or place a portable copy under tools\\7zip-portable, then retry."
                     )
-                    log_info("7-Zip not found; proceeding with online driver export fallback.")
-
-        if not repository_packages:
-            exported_online_drivers_root = Path(tempfile.mkdtemp(prefix="MateBookOnlineDriverExport_"))
-            effective_drivers_root = export_online_drivers(
-                destination_root=exported_online_drivers_root,
-                on_progress=on_progress,
-                percent=5,
-            )
-            repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
 
         if not repository_packages:
             extension_summary = summarize_driver_extensions(drivers_root)
@@ -1104,7 +1143,7 @@ def invoke_usb_creation(
                 percent=5,
                 message=(
                     "No Wi-Fi INF package was positively identified. "
-                    "Continuing with full exported INF driver set."
+                    "Continuing with full provided INF driver set."
                 ),
                 on_progress=on_progress,
             )
@@ -1326,8 +1365,6 @@ def invoke_usb_creation(
             shutil.rmtree(extracted_drivers_root, ignore_errors=True)
         if extracted_installers_root and extracted_installers_root.exists():
             shutil.rmtree(extracted_installers_root, ignore_errors=True)
-        if exported_online_drivers_root and exported_online_drivers_root.exists():
-            shutil.rmtree(exported_online_drivers_root, ignore_errors=True)
 
         shutil.rmtree(work_root, ignore_errors=True)
         log_info("USB creation cleanup finished.")

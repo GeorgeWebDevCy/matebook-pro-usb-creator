@@ -121,13 +121,52 @@ function Invoke-ExternalCommand {
             }
         }
 
-        if ($AcceptExitCodes -notcontains $process.ExitCode) {
+        $exitCode = $null
+        try {
+            $process.Refresh()
+            $exitCode = $process.ExitCode
+        }
+        catch {
+            $exitCode = $null
+        }
+
+        # Start-Process can occasionally return a null ExitCode for robocopy in
+        # long-running redirected-output sessions. Fall back to robocopy summary.
+        if ($null -eq $exitCode -and [System.IO.Path]::GetFileName($FilePath).Equals("robocopy.exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $summaryFound = $false
+            $failedDetected = $false
+            foreach ($line in $output) {
+                if (-not $line) {
+                    continue
+                }
+
+                if ($line -match "^\s*(Dirs|Files)\s*:\s*\S+\s+\S+\s+\S+\s+\S+\s+(\S+)") {
+                    $summaryFound = $true
+                    $failedToken = ($Matches[2] -replace "[^\d]", "")
+                    if ($failedToken -and ([int]$failedToken -gt 0)) {
+                        $failedDetected = $true
+                        break
+                    }
+                }
+            }
+
+            if ($summaryFound) {
+                $exitCode = if ($failedDetected) { 8 } else { 1 }
+            }
+        }
+
+        if ($null -eq $exitCode) {
             $tail = ($output | Select-Object -Last 20) -join [Environment]::NewLine
-            throw "$ErrorMessage`nExit code: $($process.ExitCode)`nCommand: $FilePath $($Arguments -join ' ')`n$tail"
+            throw "$ErrorMessage`nExit code: <unavailable>`nCommand: $FilePath $($Arguments -join ' ')`n$tail"
+        }
+
+        if ($AcceptExitCodes -notcontains ([int]$exitCode)) {
+            $tail = ($output | Select-Object -Last 20) -join [Environment]::NewLine
+            throw "$ErrorMessage`nExit code: $exitCode`nCommand: $FilePath $($Arguments -join ' ')`n$tail"
         }
 
         return [PSCustomObject]@{
-            ExitCode = $process.ExitCode
+            ExitCode = [int]$exitCode
             Output   = $output
         }
     }

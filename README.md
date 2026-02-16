@@ -1,8 +1,21 @@
 # matebook-pro-usb-creator
 
-GUI PowerShell tool to create a Windows 11 bootable USB and inject MateBook drivers.
+GUI tool to create a Windows 11 bootable USB and inject MateBook drivers.
 
 ## Run
+
+### Python GUI (recommended)
+
+1. Open PowerShell.
+2. Run:
+
+```powershell
+python .\Create-MateBookWin11Usb.py
+```
+
+The app auto-elevates to Administrator.
+
+### PowerShell GUI (legacy)
 
 1. Open PowerShell.
 2. Run:

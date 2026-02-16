@@ -37,6 +37,8 @@ The script auto-elevates to Administrator.
 ## What it does
 
 - Detects USB targets and lets you choose one.
+- Runs a preflight driver extraction/inventory step before any USB formatting.
+- Shows a preflight summary (INF count + Wi-Fi matches) and asks for confirmation before formatting starts.
 - Formats target USB as `NTFS`.
 - Copies all Windows setup files from ISO to USB.
 - Copies INF-ready drivers (the actual set used for injection) to `USB:\MateBook-Drivers`.

@@ -63,6 +63,16 @@ class ThirdPartyDriver:
     version: str
 
 
+@dataclass(frozen=True)
+class DriverResolution:
+    effective_drivers_root: Path
+    repository_packages: list[DriverPackage]
+    wifi_packages: list[DriverPackage]
+    extracted_drivers_root: Path | None
+    extracted_installers_root: Path | None
+    source_description: str
+
+
 class CommandError(RuntimeError):
     pass
 
@@ -576,6 +586,126 @@ def extract_driver_installers_with_7zip(
     return extraction_root
 
 
+def resolve_driver_source(
+    *,
+    drivers_root: Path,
+    on_progress: callable | None,
+) -> DriverResolution:
+    effective_drivers_root = drivers_root
+    extracted_drivers_root: Path | None = None
+    extracted_installers_root: Path | None = None
+    source_description = "direct folder INF scan"
+
+    repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
+    if not repository_packages:
+        extracted_drivers_root = extract_driver_archives(
+            drivers_root=drivers_root,
+            on_progress=on_progress,
+            percent=3,
+        )
+        effective_drivers_root = extracted_drivers_root
+        source_description = "zip extraction"
+        repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
+
+    if not repository_packages:
+        archive_like_count = len(
+            [
+                path
+                for path in effective_drivers_root.rglob("*")
+                if path.is_file() and path.suffix.lower() in {".exe", ".cab", ".zip", ".7z", ".msi", ".rar"}
+            ]
+        )
+        if archive_like_count > 0:
+            seven_zip_path = find_7zip_executable()
+            if seven_zip_path:
+                extracted_installers_root = Path(tempfile.mkdtemp(prefix="MateBookDriverExeExtract_"))
+                effective_drivers_root = extract_driver_installers_with_7zip(
+                    source_root=effective_drivers_root,
+                    destination_root=extracted_installers_root,
+                    seven_zip_path=seven_zip_path,
+                    on_progress=on_progress,
+                    percent=4,
+                )
+                source_description = "zip extraction + recursive 7-Zip extraction"
+                repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
+            else:
+                raise RuntimeError(
+                    "Driver packages are installer EXEs (no INF files yet), and 7-Zip is not available. "
+                    "Install 7-Zip or place a portable copy under tools\\7zip-portable, then retry."
+                )
+
+    if not repository_packages:
+        extension_summary = summarize_driver_extensions(drivers_root)
+        raise RuntimeError(
+            f"No .inf driver packages found under: {drivers_root}. "
+            f"Top file types: {extension_summary}"
+        )
+
+    wifi_packages = get_wifi_driver_packages(repository_packages)
+    write_stage(
+        percent=5,
+        message=(
+            f"Driver source resolved ({source_description}). "
+            f"INF packages discovered: {len(repository_packages)}."
+        ),
+        on_progress=on_progress,
+    )
+
+    return DriverResolution(
+        effective_drivers_root=effective_drivers_root,
+        repository_packages=repository_packages,
+        wifi_packages=wifi_packages,
+        extracted_drivers_root=extracted_drivers_root,
+        extracted_installers_root=extracted_installers_root,
+        source_description=source_description,
+    )
+
+
+def cleanup_driver_resolution(resolution: DriverResolution | None) -> None:
+    if resolution is None:
+        return
+
+    if resolution.extracted_drivers_root and resolution.extracted_drivers_root.exists():
+        shutil.rmtree(resolution.extracted_drivers_root, ignore_errors=True)
+    if resolution.extracted_installers_root and resolution.extracted_installers_root.exists():
+        shutil.rmtree(resolution.extracted_installers_root, ignore_errors=True)
+
+
+def analyze_driver_source(
+    *,
+    drivers_path: str,
+    on_progress: callable | None,
+) -> dict[str, object]:
+    drivers_root = Path(drivers_path)
+    if not drivers_root.exists():
+        raise RuntimeError(f"Driver folder not found: {drivers_path}")
+
+    write_stage(percent=1, message="Preflight: analyzing driver source...", on_progress=on_progress)
+    resolution: DriverResolution | None = None
+    try:
+        resolution = resolve_driver_source(drivers_root=drivers_root, on_progress=on_progress)
+        inf_count = len(resolution.repository_packages)
+        wifi_count = len(resolution.wifi_packages)
+
+        write_stage(
+            percent=100,
+            message=(
+                "Preflight complete: "
+                f"INF={inf_count}, Wi-Fi INF matches={wifi_count}, "
+                f"source={resolution.source_description}"
+            ),
+            on_progress=on_progress,
+        )
+
+        return {
+            "inf_count": inf_count,
+            "wifi_count": wifi_count,
+            "source_description": resolution.source_description,
+        }
+    finally:
+        cleanup_driver_resolution(resolution)
+
+
 def read_inf_text(full_path: str) -> str:
     data = Path(full_path).read_bytes()
     return data.decode("latin-1", errors="ignore")
@@ -1065,13 +1195,13 @@ def invoke_usb_creation(
     iso_path: str,
     drivers_path: str,
     drive_letter: str,
+    prepared_driver_resolution: DriverResolution | None = None,
     on_progress: callable | None,
 ) -> None:
     target_drive = drive_letter.strip().upper().rstrip(":")
     destination_root = f"{target_drive}:\\"
     mounted_iso = False
-    extracted_drivers_root: Path | None = None
-    extracted_installers_root: Path | None = None
+    driver_resolution: DriverResolution | None = None
     iso_file = Path(iso_path)
     work_root = Path(tempfile.mkdtemp(prefix="MateBookUsbCreator_"))
     mount_dir = work_root / "Mount"
@@ -1093,50 +1223,27 @@ def invoke_usb_creation(
         if target_drive == os.environ.get("SystemDrive", "C:").rstrip(":").upper():
             raise RuntimeError("Selected drive is the system drive. Select a USB drive.")
 
-        repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
-        if not repository_packages:
-            extracted_drivers_root = extract_driver_archives(
-                drivers_root=drivers_root,
+        if prepared_driver_resolution is not None:
+            driver_resolution = prepared_driver_resolution
+            write_stage(
+                percent=2,
+                message="Using preflight driver extraction results.",
                 on_progress=on_progress,
-                percent=3,
             )
-            effective_drivers_root = extracted_drivers_root
-            repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
+        else:
+            driver_resolution = resolve_driver_source(drivers_root=drivers_root, on_progress=on_progress)
+        effective_drivers_root = driver_resolution.effective_drivers_root
+        repository_packages = driver_resolution.repository_packages
+        wifi_packages = driver_resolution.wifi_packages
+        write_stage(
+            percent=6,
+            message=(
+                f"Driver inventory ready: INF={len(repository_packages)}, "
+                f"Wi-Fi INF matches={len(wifi_packages)}, source={driver_resolution.source_description}"
+            ),
+            on_progress=on_progress,
+        )
 
-        if not repository_packages:
-            exe_count = len(
-                [
-                    path
-                    for path in effective_drivers_root.rglob("*")
-                    if path.is_file() and path.suffix.lower() == ".exe"
-                ]
-            )
-            if exe_count > 0:
-                seven_zip_path = find_7zip_executable()
-                if seven_zip_path:
-                    extracted_installers_root = Path(tempfile.mkdtemp(prefix="MateBookDriverExeExtract_"))
-                    effective_drivers_root = extract_driver_installers_with_7zip(
-                        source_root=effective_drivers_root,
-                        destination_root=extracted_installers_root,
-                        seven_zip_path=seven_zip_path,
-                        on_progress=on_progress,
-                        percent=4,
-                    )
-                    repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
-                else:
-                    raise RuntimeError(
-                        "Driver packages are installer EXEs (no INF files yet), and 7-Zip is not available. "
-                        "Install 7-Zip or place a portable copy under tools\\7zip-portable, then retry."
-                    )
-
-        if not repository_packages:
-            extension_summary = summarize_driver_extensions(drivers_root)
-            raise RuntimeError(
-                f"No .inf driver packages found under: {drivers_path}. "
-                f"Top file types: {extension_summary}"
-            )
-
-        wifi_packages = get_wifi_driver_packages(repository_packages)
         if not wifi_packages:
             wifi_inf_file_names = []
             write_stage(
@@ -1361,10 +1468,7 @@ def invoke_usb_creation(
         except Exception:
             pass
 
-        if extracted_drivers_root and extracted_drivers_root.exists():
-            shutil.rmtree(extracted_drivers_root, ignore_errors=True)
-        if extracted_installers_root and extracted_installers_root.exists():
-            shutil.rmtree(extracted_installers_root, ignore_errors=True)
+        cleanup_driver_resolution(driver_resolution)
 
         shutil.rmtree(work_root, ignore_errors=True)
         log_info("USB creation cleanup finished.")
@@ -1380,6 +1484,8 @@ class MateBookUsbCreatorApp:
         self.is_running = False
         self.ui_queue: queue.Queue = queue.Queue()
         self.usb_display_to_letter: dict[str, str] = {}
+        self.pending_creation_request: dict[str, str] | None = None
+        self.prepared_driver_resolution: DriverResolution | None = None
 
         self.iso_var = StringVar(value=DEFAULT_ISO_PATH)
         self.drivers_var = StringVar(value=DEFAULT_DRIVERS_PATH)
@@ -1515,20 +1621,24 @@ class MateBookUsbCreatorApp:
             messagebox.showwarning("Validation error", "Select a USB target.")
             return
 
-        confirm = messagebox.askyesno("Confirm format", f"This will erase all data on {drive_letter}:. Continue?")
-        if not confirm:
-            return
-
         self.txt_log.configure(state="normal")
         self.txt_log.delete("1.0", "end")
         self.txt_log.configure(state="disabled")
         self.progress["value"] = 0
-        self.status_var.set("Starting...")
+        self.status_var.set("Preflight: analyzing drivers...")
         self._set_controls_enabled(False)
         self.is_running = True
+        if self.prepared_driver_resolution is not None:
+            cleanup_driver_resolution(self.prepared_driver_resolution)
+            self.prepared_driver_resolution = None
+        self.pending_creation_request = {
+            "iso_path": iso_path,
+            "drivers_path": drivers_path,
+            "drive_letter": drive_letter,
+        }
 
         worker = threading.Thread(
-            target=self._run_creation_worker,
+            target=self._run_preflight_worker,
             kwargs={
                 "iso_path": iso_path,
                 "drivers_path": drivers_path,
@@ -1538,7 +1648,63 @@ class MateBookUsbCreatorApp:
         )
         worker.start()
 
-    def _run_creation_worker(self, *, iso_path: str, drivers_path: str, drive_letter: str) -> None:
+    def _start_creation_worker(
+        self,
+        *,
+        iso_path: str,
+        drivers_path: str,
+        drive_letter: str,
+        prepared_driver_resolution: DriverResolution | None,
+    ) -> None:
+        worker = threading.Thread(
+            target=self._run_creation_worker,
+            kwargs={
+                "iso_path": iso_path,
+                "drivers_path": drivers_path,
+                "drive_letter": drive_letter,
+                "prepared_driver_resolution": prepared_driver_resolution,
+            },
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_preflight_worker(self, *, iso_path: str, drivers_path: str, drive_letter: str) -> None:
+        def progress_callback(percent: int, message: str) -> None:
+            self.ui_queue.put(("progress", int(percent), f"Preflight: {message}"))
+
+        resolution: DriverResolution | None = None
+        try:
+            log_info(
+                "Preflight worker started. "
+                f"iso_path={iso_path} drivers_path={drivers_path} drive_letter={drive_letter}"
+            )
+            drivers_root = Path(drivers_path)
+            if not drivers_root.exists():
+                raise RuntimeError(f"Driver folder not found: {drivers_path}")
+
+            resolution = resolve_driver_source(
+                drivers_root=drivers_root,
+                on_progress=progress_callback,
+            )
+            summary = {
+                "inf_count": len(resolution.repository_packages),
+                "wifi_count": len(resolution.wifi_packages),
+                "source_description": resolution.source_description,
+            }
+            self.ui_queue.put(("preflight_ready", iso_path, drivers_path, drive_letter, summary, resolution))
+        except Exception as exc:
+            cleanup_driver_resolution(resolution)
+            log_exception("Preflight worker failed.")
+            self.ui_queue.put(("preflight_error", str(exc), traceback.format_exc()))
+
+    def _run_creation_worker(
+        self,
+        *,
+        iso_path: str,
+        drivers_path: str,
+        drive_letter: str,
+        prepared_driver_resolution: DriverResolution | None,
+    ) -> None:
         def progress_callback(percent: int, message: str) -> None:
             self.ui_queue.put(("progress", int(percent), str(message)))
 
@@ -1551,6 +1717,7 @@ class MateBookUsbCreatorApp:
                 iso_path=iso_path,
                 drivers_path=drivers_path,
                 drive_letter=drive_letter,
+                prepared_driver_resolution=prepared_driver_resolution,
                 on_progress=progress_callback,
             )
             log_info("Worker thread finished successfully.")
@@ -1574,6 +1741,63 @@ class MateBookUsbCreatorApp:
                 self.progress["value"] = max(0, min(100, int(percent)))
                 self.status_var.set(message)
                 self.append_log(message)
+            elif event_type == "preflight_ready":
+                _, iso_path, drivers_path, drive_letter, summary, resolution = event
+                inf_count = int(summary.get("inf_count", 0))
+                wifi_count = int(summary.get("wifi_count", 0))
+                source_description = str(summary.get("source_description", "unknown"))
+                self.prepared_driver_resolution = resolution
+                self.status_var.set("Preflight complete")
+                self.append_log(
+                    f"Preflight summary: INF={inf_count}, Wi-Fi INF matches={wifi_count}, source={source_description}"
+                )
+
+                confirm = messagebox.askyesno(
+                    "Preflight Complete",
+                    (
+                        "Driver extraction/inventory is complete.\n\n"
+                        f"INF packages found: {inf_count}\n"
+                        f"Wi-Fi INF matches: {wifi_count}\n"
+                        f"Source mode: {source_description}\n\n"
+                        f"Proceed to format {drive_letter}: and create the USB?"
+                    ),
+                )
+                if not confirm:
+                    self.append_log("Cancelled by user before USB formatting.")
+                    self.status_var.set("Cancelled")
+                    cleanup_driver_resolution(self.prepared_driver_resolution)
+                    self.prepared_driver_resolution = None
+                    self._set_controls_enabled(True)
+                    self.is_running = False
+                    self.pending_creation_request = None
+                    continue
+
+                self.append_log(f"Confirmed. Starting USB creation on {drive_letter}:")
+                self.progress["value"] = 0
+                self.status_var.set("Starting USB creation...")
+                self.pending_creation_request = None
+                prepared_resolution = self.prepared_driver_resolution
+                self.prepared_driver_resolution = None
+                self._start_creation_worker(
+                    iso_path=iso_path,
+                    drivers_path=drivers_path,
+                    drive_letter=drive_letter,
+                    prepared_driver_resolution=prepared_resolution,
+                )
+            elif event_type == "preflight_error":
+                _, message, trace = event
+                self.status_var.set("Preflight failed")
+                self.append_log("")
+                self.append_log(f"ERROR: {message}")
+                self.append_log("Traceback:")
+                for trace_line in trace.splitlines():
+                    self.append_log(trace_line)
+                messagebox.showerror("MateBook Win11 USB Creator", f"Driver preflight failed.\n\n{message}")
+                cleanup_driver_resolution(self.prepared_driver_resolution)
+                self.prepared_driver_resolution = None
+                self._set_controls_enabled(True)
+                self.is_running = False
+                self.pending_creation_request = None
             elif event_type == "success":
                 self.status_var.set("Done")
                 messagebox.showinfo("MateBook Win11 USB Creator", "Bootable USB has been created successfully.")
@@ -1587,6 +1811,8 @@ class MateBookUsbCreatorApp:
                     self.append_log(trace_line)
                 messagebox.showerror("MateBook Win11 USB Creator", f"USB creation failed.\n\n{message}")
             elif event_type == "complete":
+                cleanup_driver_resolution(self.prepared_driver_resolution)
+                self.prepared_driver_resolution = None
                 self._set_controls_enabled(True)
                 self.is_running = False
 
@@ -1599,6 +1825,8 @@ class MateBookUsbCreatorApp:
                 "USB creation is currently running. Wait for completion before closing.",
             )
             return
+        cleanup_driver_resolution(self.prepared_driver_resolution)
+        self.prepared_driver_resolution = None
         self.root.destroy()
 
 

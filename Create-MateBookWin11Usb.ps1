@@ -609,8 +609,7 @@ $btnStart.Add_Click({
         try {
             $progressCallback = {
                 param($percent, $message)
-                Update-UiProgress -Percent ([int]$percent) -Message ([string]$message
-                )
+                Update-UiProgress -Percent ([int]$percent) -Message ([string]$message)
             }
 
             Invoke-UsbCreation -IsoPath $isoPath -DriversPath $driversPath -DriveLetter $driveLetter -OnProgress $progressCallback

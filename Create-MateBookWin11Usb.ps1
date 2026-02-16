@@ -42,27 +42,83 @@ function Invoke-ExternalCommand {
         [string[]]$Arguments = @(),
         [Parameter(Mandatory)]
         [string]$ErrorMessage,
-        [int[]]$AcceptExitCodes = @(0)
+        [int[]]$AcceptExitCodes = @(0),
+        [scriptblock]$OnOutputLine
     )
 
     $stdoutFile = [System.IO.Path]::GetTempFileName()
     $stderrFile = [System.IO.Path]::GetTempFileName()
 
     try {
-        $process = Start-Process -FilePath $FilePath `
-            -ArgumentList $Arguments `
-            -NoNewWindow `
-            -Wait `
-            -PassThru `
-            -RedirectStandardOutput $stdoutFile `
-            -RedirectStandardError $stderrFile
-
         $output = @()
-        if (Test-Path -LiteralPath $stdoutFile) {
-            $output += Get-Content -LiteralPath $stdoutFile -ErrorAction SilentlyContinue
+        if ($OnOutputLine) {
+            $process = Start-Process -FilePath $FilePath `
+                -ArgumentList $Arguments `
+                -NoNewWindow `
+                -PassThru `
+                -RedirectStandardOutput $stdoutFile `
+                -RedirectStandardError $stderrFile
+
+            $stdoutReadCount = 0
+            $stderrReadCount = 0
+            while (-not $process.HasExited) {
+                if (Test-Path -LiteralPath $stdoutFile) {
+                    $stdoutLines = @(Get-Content -LiteralPath $stdoutFile -ErrorAction SilentlyContinue)
+                    for ($i = $stdoutReadCount; $i -lt $stdoutLines.Count; $i++) {
+                        $line = [string]$stdoutLines[$i]
+                        $output += $line
+                        & $OnOutputLine $line
+                    }
+                    $stdoutReadCount = $stdoutLines.Count
+                }
+
+                if (Test-Path -LiteralPath $stderrFile) {
+                    $stderrLines = @(Get-Content -LiteralPath $stderrFile -ErrorAction SilentlyContinue)
+                    for ($i = $stderrReadCount; $i -lt $stderrLines.Count; $i++) {
+                        $line = [string]$stderrLines[$i]
+                        $output += $line
+                        & $OnOutputLine $line
+                    }
+                    $stderrReadCount = $stderrLines.Count
+                }
+
+                Start-Sleep -Milliseconds 250
+            }
+            $process.WaitForExit()
+
+            if (Test-Path -LiteralPath $stdoutFile) {
+                $stdoutLines = @(Get-Content -LiteralPath $stdoutFile -ErrorAction SilentlyContinue)
+                for ($i = $stdoutReadCount; $i -lt $stdoutLines.Count; $i++) {
+                    $line = [string]$stdoutLines[$i]
+                    $output += $line
+                    & $OnOutputLine $line
+                }
+            }
+
+            if (Test-Path -LiteralPath $stderrFile) {
+                $stderrLines = @(Get-Content -LiteralPath $stderrFile -ErrorAction SilentlyContinue)
+                for ($i = $stderrReadCount; $i -lt $stderrLines.Count; $i++) {
+                    $line = [string]$stderrLines[$i]
+                    $output += $line
+                    & $OnOutputLine $line
+                }
+            }
         }
-        if (Test-Path -LiteralPath $stderrFile) {
-            $output += Get-Content -LiteralPath $stderrFile -ErrorAction SilentlyContinue
+        else {
+            $process = Start-Process -FilePath $FilePath `
+                -ArgumentList $Arguments `
+                -NoNewWindow `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $stdoutFile `
+                -RedirectStandardError $stderrFile
+
+            if (Test-Path -LiteralPath $stdoutFile) {
+                $output += Get-Content -LiteralPath $stdoutFile -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $stderrFile) {
+                $output += Get-Content -LiteralPath $stderrFile -ErrorAction SilentlyContinue
+            }
         }
 
         if ($AcceptExitCodes -notcontains $process.ExitCode) {
@@ -78,6 +134,47 @@ function Invoke-ExternalCommand {
     finally {
         Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Write-CommandOutput {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Line,
+        [Parameter(Mandatory)]
+        [int]$Percent,
+        [Parameter(Mandatory)]
+        [string]$Prefix,
+        [scriptblock]$OnProgress,
+        [switch]$RobocopyOnly
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Line)) {
+        return
+    }
+
+    $cleanLine = $Line.Trim()
+    if (-not $cleanLine) {
+        return
+    }
+
+    if ($RobocopyOnly) {
+        $shouldShow = $false
+        if ($cleanLine -match "^\d+(\.\d+)?%") {
+            $shouldShow = $true
+        }
+        if ($cleanLine -match "\b(New File|New Dir|Older|Newer|Changed|Extra|Same)\b") {
+            $shouldShow = $true
+        }
+        if ($cleanLine -match "^(Started|Ended|Source|Dest|Files|Options|Bytes|Times|Speed|Total|Dirs)\b") {
+            $shouldShow = $true
+        }
+
+        if (-not $shouldShow) {
+            return
+        }
+    }
+
+    Write-Stage -Percent $Percent -Message "$Prefix$cleanLine" -OnProgress $OnProgress
 }
 
 function Get-WimIndexes {
@@ -140,28 +237,48 @@ function Add-DriversToWim {
 
         $mounted = $false
         try {
+            $mountOutput = {
+                param($line)
+                Write-CommandOutput -Line ([string]$line) -Percent $beforePercent -Prefix "${Label}[$index] " -OnProgress $OnProgress
+            }
             Invoke-ExternalCommand -FilePath "dism.exe" `
                 -Arguments @("/Mount-Image", "/ImageFile:$WimPath", "/Index:$index", "/MountDir:$MountDir") `
-                -ErrorMessage "$Label index $index mount failed" | Out-Null
+                -ErrorMessage "$Label index $index mount failed" `
+                -OnOutputLine $mountOutput | Out-Null
             $mounted = $true
 
             Write-Stage -Percent $beforePercent -Message "${Label}: injecting drivers into index $index..." -OnProgress $OnProgress
+            $addDriverOutput = {
+                param($line)
+                Write-CommandOutput -Line ([string]$line) -Percent $beforePercent -Prefix "${Label}[$index] " -OnProgress $OnProgress
+            }
             Invoke-ExternalCommand -FilePath "dism.exe" `
                 -Arguments @("/Image:$MountDir", "/Add-Driver", "/Driver:$DriversPath", "/Recurse") `
-                -ErrorMessage "$Label index $index driver injection failed" | Out-Null
+                -ErrorMessage "$Label index $index driver injection failed" `
+                -OnOutputLine $addDriverOutput | Out-Null
 
             Write-Stage -Percent $beforePercent -Message "${Label}: committing index $index..." -OnProgress $OnProgress
+            $commitOutput = {
+                param($line)
+                Write-CommandOutput -Line ([string]$line) -Percent $beforePercent -Prefix "${Label}[$index] " -OnProgress $OnProgress
+            }
             Invoke-ExternalCommand -FilePath "dism.exe" `
                 -Arguments @("/Unmount-Image", "/MountDir:$MountDir", "/Commit") `
-                -ErrorMessage "$Label index $index commit failed" | Out-Null
+                -ErrorMessage "$Label index $index commit failed" `
+                -OnOutputLine $commitOutput | Out-Null
             $mounted = $false
         }
         catch {
             if ($mounted) {
                 try {
+                    $discardOutput = {
+                        param($line)
+                        Write-CommandOutput -Line ([string]$line) -Percent $beforePercent -Prefix "${Label}[$index] " -OnProgress $OnProgress
+                    }
                     Invoke-ExternalCommand -FilePath "dism.exe" `
                         -Arguments @("/Unmount-Image", "/MountDir:$MountDir", "/Discard") `
-                        -ErrorMessage "$Label cleanup discard failed" | Out-Null
+                        -ErrorMessage "$Label cleanup discard failed" `
+                        -OnOutputLine $discardOutput | Out-Null
                 }
                 catch {
                     # Best effort cleanup only.
@@ -202,9 +319,14 @@ function Convert-InstallEsdToWim {
         $beforePercent = $StartPercent + [int](($position - 1) * $range / $count)
         Write-Stage -Percent $beforePercent -Message "Converting install.esd index $index to install.wim..." -OnProgress $OnProgress
 
+        $convertOutput = {
+            param($line)
+            Write-CommandOutput -Line ([string]$line) -Percent $beforePercent -Prefix "install.wim[$index] " -OnProgress $OnProgress
+        }
         Invoke-ExternalCommand -FilePath "dism.exe" `
             -Arguments @("/Export-Image", "/SourceImageFile:$EsdPath", "/SourceIndex:$index", "/DestinationImageFile:$WimPath", "/Compress:max", "/CheckIntegrity") `
-            -ErrorMessage "Failed to convert install.esd index $index to install.wim" | Out-Null
+            -ErrorMessage "Failed to convert install.esd index $index to install.wim" `
+            -OnOutputLine $convertOutput | Out-Null
 
         $afterPercent = $StartPercent + [int]($position * $range / $count)
         Write-Stage -Percent $afterPercent -Message "Converted install.esd index $index." -OnProgress $OnProgress
@@ -262,10 +384,15 @@ function Invoke-UsbCreation {
         $isoRoot = "$isoDriveLetter`:\"
 
         Write-Stage -Percent 25 -Message "Copying Windows setup files to USB..." -OnProgress $OnProgress
+        $isoCopyOutput = {
+            param($line)
+            Write-CommandOutput -Line ([string]$line) -Percent 25 -Prefix "ISO copy: " -OnProgress $OnProgress -RobocopyOnly
+        }
         Invoke-ExternalCommand -FilePath "robocopy.exe" `
-            -Arguments @($isoRoot, $destinationRoot, "*.*", "/E", "/R:1", "/W:1", "/COPY:DAT", "/DCOPY:DAT", "/NP", "/NFL", "/NDL", "/NJH", "/NJS") `
+            -Arguments @($isoRoot, $destinationRoot, "*.*", "/E", "/R:1", "/W:1", "/COPY:DAT", "/DCOPY:DAT", "/TEE", "/NP") `
             -ErrorMessage "Failed to copy ISO files to USB" `
-            -AcceptExitCodes @(0, 1, 2, 3, 4, 5, 6, 7) | Out-Null
+            -AcceptExitCodes @(0, 1, 2, 3, 4, 5, 6, 7) `
+            -OnOutputLine $isoCopyOutput | Out-Null
 
         Write-Stage -Percent 45 -Message "Copying driver repository to USB..." -OnProgress $OnProgress
         $driverDestination = Join-Path -Path $destinationRoot -ChildPath "MateBook-Drivers"
@@ -273,10 +400,15 @@ function Invoke-UsbCreation {
             Remove-Item -LiteralPath $driverDestination -Recurse -Force
         }
         New-Item -ItemType Directory -Path $driverDestination -Force | Out-Null
+        $driverCopyOutput = {
+            param($line)
+            Write-CommandOutput -Line ([string]$line) -Percent 45 -Prefix "Driver copy: " -OnProgress $OnProgress -RobocopyOnly
+        }
         Invoke-ExternalCommand -FilePath "robocopy.exe" `
-            -Arguments @($DriversPath, $driverDestination, "*.*", "/E", "/R:1", "/W:1", "/COPY:DAT", "/DCOPY:DAT", "/NP", "/NFL", "/NDL", "/NJH", "/NJS") `
+            -Arguments @($DriversPath, $driverDestination, "*.*", "/E", "/R:1", "/W:1", "/COPY:DAT", "/DCOPY:DAT", "/TEE", "/NP") `
             -ErrorMessage "Failed to copy drivers to USB" `
-            -AcceptExitCodes @(0, 1, 2, 3, 4, 5, 6, 7) | Out-Null
+            -AcceptExitCodes @(0, 1, 2, 3, 4, 5, 6, 7) `
+            -OnOutputLine $driverCopyOutput | Out-Null
 
         $sourcesPath = Join-Path -Path $destinationRoot -ChildPath "sources"
         $bootWim = Join-Path -Path $sourcesPath -ChildPath "boot.wim"
@@ -312,9 +444,14 @@ function Invoke-UsbCreation {
         $bootsectPath = Join-Path -Path $isoRoot -ChildPath "boot\bootsect.exe"
         if (Test-Path -LiteralPath $bootsectPath) {
             Write-Stage -Percent 97 -Message "Applying BIOS boot code..." -OnProgress $OnProgress
+            $bootsectOutput = {
+                param($line)
+                Write-CommandOutput -Line ([string]$line) -Percent 97 -Prefix "bootsect: " -OnProgress $OnProgress
+            }
             Invoke-ExternalCommand -FilePath $bootsectPath `
                 -Arguments @("/nt60", "$targetDrive`:", "/mbr") `
-                -ErrorMessage "bootsect failed" | Out-Null
+                -ErrorMessage "bootsect failed" `
+                -OnOutputLine $bootsectOutput | Out-Null
         }
 
         Write-Stage -Percent 100 -Message "Completed successfully." -OnProgress $OnProgress

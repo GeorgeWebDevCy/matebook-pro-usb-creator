@@ -14,6 +14,7 @@ python .\Create-MateBookWin11Usb.py
 ```
 
 The app auto-elevates to Administrator.
+If the Python window closes unexpectedly, check `Create-MateBookWin11Usb.log` in this folder.
 
 ### PowerShell GUI (legacy)
 
@@ -38,8 +39,15 @@ The script auto-elevates to Administrator.
 - Detects USB targets and lets you choose one.
 - Formats target USB as `NTFS`.
 - Copies all Windows setup files from ISO to USB.
-- Copies your driver repository to `USB:\MateBook-Drivers`.
+- Copies INF-ready drivers (the actual set used for injection) to `USB:\MateBook-Drivers`.
+- If driver source had to be transformed (zip/exe/export), original source is also copied to `USB:\MateBook-Drivers-Source`.
 - Injects drivers into `sources\boot.wim` and `sources\install.wim` (all indexes).
 - Shows live progress and log output in the GUI.
+
+Driver source note:
+- The injector needs `.inf` packages.
+- If your folder only has Huawei ZIPs, the app auto-extracts ZIPs.
+- If those ZIPs contain installer EXEs, the app tries `7-Zip` extraction and caches a portable copy under `tools\7zip-portable`.
+- If no `.inf` packages are found after extraction, the app falls back to exporting installed drivers from the current Windows system.
 
 Warning: target USB is fully erased.

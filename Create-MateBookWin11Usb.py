@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import locale
+import logging
 import os
 import queue
 import re
@@ -12,17 +13,31 @@ import sys
 import tempfile
 import threading
 import traceback
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import StringVar, Tk, filedialog, messagebox
-from tkinter import ttk
-from tkinter.scrolledtext import ScrolledText
+
+try:
+    from tkinter import StringVar, Tk, filedialog, messagebox
+    from tkinter import ttk
+    from tkinter.scrolledtext import ScrolledText
+    TK_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    StringVar = Tk = filedialog = messagebox = None  # type: ignore[assignment]
+    ttk = None  # type: ignore[assignment]
+    ScrolledText = None  # type: ignore[assignment]
+    TK_IMPORT_ERROR = exc
 
 
 DEFAULT_ISO_PATH = r"C:\Users\georg\Downloads\Win11_25H2_EnglishInternational_x64.iso"
 DEFAULT_DRIVERS_PATH = r"D:\Matebook Drivers"
 DEFAULT_USB_LETTER = "E"
+SCRIPT_PATH = Path(__file__).resolve()
+LOG_PATH = SCRIPT_PATH.with_suffix(".log")
+PORTABLE_7ZIP_DIR = SCRIPT_PATH.parent / "tools" / "7zip-portable"
+
+LOGGER = logging.getLogger("matebook_win11_usb_creator")
 
 
 @dataclass(frozen=True)
@@ -52,6 +67,45 @@ class CommandError(RuntimeError):
     pass
 
 
+def configure_logging() -> None:
+    if LOGGER.handlers:
+        return
+
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    except Exception:
+        return
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler.setFormatter(formatter)
+    LOGGER.addHandler(file_handler)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    LOGGER.info("----- Session start -----")
+
+
+def log_info(message: str) -> None:
+    try:
+        LOGGER.info(message)
+    except Exception:
+        pass
+
+
+def log_exception(message: str) -> None:
+    try:
+        LOGGER.exception(message)
+    except Exception:
+        pass
+
+
+def show_startup_error(message: str) -> None:
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, "MateBook Win11 USB Creator", 0x10)
+    except Exception:
+        print(message, file=sys.stderr)
+
+
 def is_user_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -60,13 +114,20 @@ def is_user_admin() -> bool:
 
 
 def relaunch_as_admin() -> None:
-    params = subprocess.list2cmdline(sys.argv)
+    script_path = str(Path(sys.argv[0]).resolve())
+    launch_arguments = [script_path, *sys.argv[1:]]
+    params = subprocess.list2cmdline(launch_arguments)
+    working_directory = str(Path(script_path).parent)
+    log_info(
+        "Requesting UAC elevation. "
+        f"Executable={sys.executable} Script={script_path} Cwd={os.getcwd()}"
+    )
     result = ctypes.windll.shell32.ShellExecuteW(
         None,
         "runas",
         sys.executable,
         params,
-        None,
+        working_directory,
         1,
     )
     if result <= 32:
@@ -119,6 +180,8 @@ def run_command(
     output: list[str] = []
     encoding = get_oem_encoding()
     command = [file_path, *arguments]
+    command_text = " ".join(command)
+    log_info(f"Running command: {command_text}")
 
     process = subprocess.Popen(
         command,
@@ -145,16 +208,19 @@ def run_command(
 
     if exit_code is None:
         tail = "\n".join(output[-20:])
+        log_info(f"Command returned no exit code: {command_text}")
         raise CommandError(
             f"{error_message}\nExit code: <unavailable>\nCommand: {file_path} {' '.join(arguments)}\n{tail}"
         )
 
     if int(exit_code) not in accept_exit_codes:
         tail = "\n".join(output[-20:])
+        log_info(f"Command failed with exit code {exit_code}: {command_text}")
         raise CommandError(
             f"{error_message}\nExit code: {exit_code}\nCommand: {file_path} {' '.join(arguments)}\n{tail}"
         )
 
+    log_info(f"Command completed with exit code {exit_code}: {command_text}")
     return CommandResult(exit_code=int(exit_code), output=output)
 
 
@@ -267,6 +333,164 @@ def get_driver_repository_inf_files(drivers_path: str) -> list[DriverPackage]:
             )
         )
     return entries
+
+
+def summarize_driver_extensions(root: Path, max_items: int = 8) -> str:
+    counts: dict[str, int] = {}
+    for file_path in root.rglob("*"):
+        if not file_path.is_file():
+            continue
+        extension = file_path.suffix.lower() or "<noext>"
+        counts[extension] = counts.get(extension, 0) + 1
+
+    if not counts:
+        return "no files found"
+
+    top_items = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:max_items]
+    return ", ".join(f"{ext}={count}" for ext, count in top_items)
+
+
+def extract_driver_archives(
+    *,
+    drivers_root: Path,
+    on_progress: callable | None,
+    percent: int,
+) -> Path:
+    zip_files = sorted(
+        [path for path in drivers_root.rglob("*") if path.is_file() and path.suffix.lower() == ".zip"],
+        key=lambda path: str(path).lower(),
+    )
+    if not zip_files:
+        raise RuntimeError("No .zip archives were found to extract.")
+
+    extraction_root = Path(tempfile.mkdtemp(prefix="MateBookDriverZipExtract_"))
+    write_stage(
+        percent=percent,
+        message=f"No .inf files found directly. Extracting {len(zip_files)} zip archive(s) to temporary folder...",
+        on_progress=on_progress,
+    )
+    log_info(f"Extracting {len(zip_files)} driver zip archive(s) into: {extraction_root}")
+
+    for index, zip_path in enumerate(zip_files, start=1):
+        relative_zip = zip_path.relative_to(drivers_root)
+        destination_folder = extraction_root / relative_zip.parent / zip_path.stem
+        destination_folder.mkdir(parents=True, exist_ok=True)
+        write_stage(
+            percent=percent,
+            message=f"Extracting archive [{index}/{len(zip_files)}]: {relative_zip}",
+            on_progress=on_progress,
+        )
+
+        try:
+            with zipfile.ZipFile(zip_path, mode="r") as archive:
+                archive.extractall(destination_folder)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to extract archive: {zip_path}\n{exc}") from exc
+
+    return extraction_root
+
+
+def find_installed_7zip_executable() -> str | None:
+    candidates = ["7z.exe", "7z", "7za.exe", "7za"]
+    for name in candidates:
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+
+    common_locations = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "7-Zip" / "7z.exe",
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "7-Zip" / "7z.exe",
+    ]
+    for candidate in common_locations:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def ensure_portable_7zip() -> str | None:
+    portable_candidates = [
+        PORTABLE_7ZIP_DIR / "7z.exe",
+        PORTABLE_7ZIP_DIR / "7za.exe",
+        PORTABLE_7ZIP_DIR / "7zz.exe",
+        PORTABLE_7ZIP_DIR / "7zr.exe",
+    ]
+    for candidate in portable_candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    installed = find_installed_7zip_executable()
+    if not installed:
+        return None
+
+    installed_path = Path(installed)
+    try:
+        PORTABLE_7ZIP_DIR.mkdir(parents=True, exist_ok=True)
+        target_exe = PORTABLE_7ZIP_DIR / installed_path.name
+        shutil.copy2(installed_path, target_exe)
+
+        # 7z.exe requires 7z.dll next to it.
+        if installed_path.name.lower() == "7z.exe":
+            installed_dll = installed_path.parent / "7z.dll"
+            if installed_dll.exists():
+                shutil.copy2(installed_dll, PORTABLE_7ZIP_DIR / "7z.dll")
+
+        log_info(f"Portable 7-Zip prepared at: {target_exe}")
+        return str(target_exe)
+    except Exception:
+        log_exception("Failed to prepare portable 7-Zip bundle.")
+        return installed
+
+
+def find_7zip_executable() -> str | None:
+    portable = ensure_portable_7zip()
+    if portable:
+        return portable
+    return find_installed_7zip_executable()
+
+
+def extract_driver_installers_with_7zip(
+    *,
+    source_root: Path,
+    destination_root: Path,
+    seven_zip_path: str,
+    on_progress: callable | None,
+    percent: int,
+) -> Path:
+    exe_files = sorted(
+        [path for path in source_root.rglob("*") if path.is_file() and path.suffix.lower() == ".exe"],
+        key=lambda path: str(path).lower(),
+    )
+    if not exe_files:
+        raise RuntimeError("No .exe installers were found to extract with 7-Zip.")
+
+    extraction_root = destination_root / "exe_extracted"
+    extraction_root.mkdir(parents=True, exist_ok=True)
+    write_stage(
+        percent=percent,
+        message=f"Found {len(exe_files)} installer EXE file(s). Attempting 7-Zip extraction...",
+        on_progress=on_progress,
+    )
+    log_info(f"Using 7-Zip at {seven_zip_path} to extract {len(exe_files)} EXE installer(s).")
+
+    for index, exe_path in enumerate(exe_files, start=1):
+        relative_exe = exe_path.relative_to(source_root)
+        destination_folder = extraction_root / relative_exe.parent / exe_path.stem
+        destination_folder.mkdir(parents=True, exist_ok=True)
+
+        write_stage(
+            percent=percent,
+            message=f"7-Zip extracting installer [{index}/{len(exe_files)}]: {relative_exe}",
+            on_progress=on_progress,
+        )
+
+        run_command(
+            seven_zip_path,
+            ["x", "-y", f"-o{destination_folder}", str(exe_path)],
+            error_message=f"Failed to extract installer with 7-Zip: {exe_path}",
+            accept_exit_codes={0},
+        )
+
+    return extraction_root
 
 
 def read_inf_text(full_path: str) -> str:
@@ -740,6 +964,28 @@ def dismount_iso(iso_path: str) -> None:
     )
 
 
+def export_online_drivers(*, destination_root: Path, on_progress: callable | None, percent: int) -> Path:
+    export_path = destination_root / "online_exported_drivers"
+    export_path.mkdir(parents=True, exist_ok=True)
+    write_stage(
+        percent=percent,
+        message=f"Exporting installed drivers from current Windows into: {export_path}",
+        on_progress=on_progress,
+    )
+    run_command(
+        "dism.exe",
+        ["/Online", "/Export-Driver", f"/Destination:{export_path}"],
+        error_message="Failed to export currently installed drivers from this system",
+        on_output_line=lambda line: write_command_output(
+            line=line,
+            percent=percent,
+            prefix="Online export: ",
+            on_progress=on_progress,
+        ),
+    )
+    return export_path
+
+
 def invoke_usb_creation(
     *,
     iso_path: str,
@@ -750,15 +996,23 @@ def invoke_usb_creation(
     target_drive = drive_letter.strip().upper().rstrip(":")
     destination_root = f"{target_drive}:\\"
     mounted_iso = False
+    extracted_drivers_root: Path | None = None
+    extracted_installers_root: Path | None = None
+    exported_online_drivers_root: Path | None = None
     iso_file = Path(iso_path)
     work_root = Path(tempfile.mkdtemp(prefix="MateBookUsbCreator_"))
     mount_dir = work_root / "Mount"
     mount_dir.mkdir(parents=True, exist_ok=True)
+    log_info(
+        "USB creation started. "
+        f"iso_path={iso_path} drivers_path={drivers_path} target_drive={target_drive}: work_root={work_root}"
+    )
 
     try:
         write_stage(percent=2, message="Validating inputs...", on_progress=on_progress)
 
         drivers_root = Path(drivers_path)
+        effective_drivers_root = drivers_root
         if not iso_file.exists():
             raise RuntimeError(f"ISO file not found: {iso_path}")
         if not drivers_root.exists():
@@ -766,18 +1020,83 @@ def invoke_usb_creation(
         if target_drive == os.environ.get("SystemDrive", "C:").rstrip(":").upper():
             raise RuntimeError("Selected drive is the system drive. Select a USB drive.")
 
-        repository_packages = get_driver_repository_inf_files(str(drivers_root))
+        repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
         if not repository_packages:
-            raise RuntimeError(f"No .inf driver packages found under: {drivers_path}")
+            extracted_drivers_root = extract_driver_archives(
+                drivers_root=drivers_root,
+                on_progress=on_progress,
+                percent=3,
+            )
+            effective_drivers_root = extracted_drivers_root
+            repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
+
+        if not repository_packages:
+            exe_count = len(
+                [
+                    path
+                    for path in effective_drivers_root.rglob("*")
+                    if path.is_file() and path.suffix.lower() == ".exe"
+                ]
+            )
+            if exe_count > 0:
+                seven_zip_path = find_7zip_executable()
+                if seven_zip_path:
+                    extracted_installers_root = Path(tempfile.mkdtemp(prefix="MateBookDriverExeExtract_"))
+                    effective_drivers_root = extract_driver_installers_with_7zip(
+                        source_root=effective_drivers_root,
+                        destination_root=extracted_installers_root,
+                        seven_zip_path=seven_zip_path,
+                        on_progress=on_progress,
+                        percent=4,
+                    )
+                    repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
+                else:
+                    write_stage(
+                        percent=4,
+                        message=(
+                            "Driver packages are installer EXEs and 7-Zip was not found. "
+                            "Falling back to exporting installed drivers from this Windows system..."
+                        ),
+                        on_progress=on_progress,
+                    )
+                    log_info("7-Zip not found; proceeding with online driver export fallback.")
+
+        if not repository_packages:
+            exported_online_drivers_root = Path(tempfile.mkdtemp(prefix="MateBookOnlineDriverExport_"))
+            effective_drivers_root = export_online_drivers(
+                destination_root=exported_online_drivers_root,
+                on_progress=on_progress,
+                percent=5,
+            )
+            repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
+
+        if not repository_packages:
+            extension_summary = summarize_driver_extensions(drivers_root)
+            raise RuntimeError(
+                f"No .inf driver packages found under: {drivers_path}. "
+                f"Top file types: {extension_summary}"
+            )
 
         wifi_packages = get_wifi_driver_packages(repository_packages)
         if not wifi_packages:
-            raise RuntimeError(f"No Wi-Fi INF drivers were detected in: {drivers_path}. Add Wi-Fi drivers and retry.")
-
-        wifi_inf_file_names = sorted({item.file_name for item in wifi_packages})
-        write_stage(percent=5, message=f"Detected {len(wifi_inf_file_names)} Wi-Fi INF package(s).", on_progress=on_progress)
-        for package in wifi_packages:
-            write_stage(percent=5, message=f"Wi-Fi package: {package.relative_path}", on_progress=on_progress)
+            wifi_inf_file_names = []
+            write_stage(
+                percent=5,
+                message=(
+                    "No Wi-Fi INF package was positively identified. "
+                    "Continuing with full exported INF driver set."
+                ),
+                on_progress=on_progress,
+            )
+            log_info(
+                "No Wi-Fi INF package matched detection rules. "
+                "Proceeding without Wi-Fi-specific post-injection verification."
+            )
+        else:
+            wifi_inf_file_names = sorted({item.file_name for item in wifi_packages})
+            write_stage(percent=5, message=f"Detected {len(wifi_inf_file_names)} Wi-Fi INF package(s).", on_progress=on_progress)
+            for package in wifi_packages:
+                write_stage(percent=5, message=f"Wi-Fi package: {package.relative_path}", on_progress=on_progress)
 
         ensure_usb_drive(target_drive)
 
@@ -810,7 +1129,7 @@ def invoke_usb_creation(
             ),
         )
 
-        write_stage(percent=45, message="Copying driver repository to USB...", on_progress=on_progress)
+        write_stage(percent=45, message="Copying INF-ready drivers to USB...", on_progress=on_progress)
         driver_destination = Path(destination_root) / "MateBook-Drivers"
         if driver_destination.exists():
             shutil.rmtree(driver_destination, ignore_errors=True)
@@ -818,16 +1137,63 @@ def invoke_usb_creation(
 
         run_command(
             "robocopy.exe",
-            [str(drivers_root), str(driver_destination), "*.*", "/E", "/R:1", "/W:1", "/COPY:DAT", "/DCOPY:DAT", "/TEE", "/NP"],
-            error_message="Failed to copy drivers to USB",
+            [
+                str(effective_drivers_root),
+                str(driver_destination),
+                "*.*",
+                "/E",
+                "/R:1",
+                "/W:1",
+                "/COPY:DAT",
+                "/DCOPY:DAT",
+                "/TEE",
+                "/NP",
+            ],
+            error_message="Failed to copy INF-ready drivers to USB",
             accept_exit_codes={0, 1, 2, 3, 4, 5, 6, 7},
             on_output_line=lambda line: write_command_output(
                 line=line,
                 percent=45,
-                prefix="Driver copy: ",
+                prefix="INF driver copy: ",
                 on_progress=on_progress,
                 robocopy_only=True,
             ),
+        )
+
+        try:
+            source_is_same = effective_drivers_root.resolve().samefile(drivers_root.resolve())
+        except Exception:
+            source_is_same = str(effective_drivers_root).lower() == str(drivers_root).lower()
+
+        if not source_is_same:
+            write_stage(
+                percent=48,
+                message="Copying original driver package source to USB...",
+                on_progress=on_progress,
+            )
+            original_source_destination = Path(destination_root) / "MateBook-Drivers-Source"
+            if original_source_destination.exists():
+                shutil.rmtree(original_source_destination, ignore_errors=True)
+            original_source_destination.mkdir(parents=True, exist_ok=True)
+
+            run_command(
+                "robocopy.exe",
+                [str(drivers_root), str(original_source_destination), "*.*", "/E", "/R:1", "/W:1", "/COPY:DAT", "/DCOPY:DAT", "/TEE", "/NP"],
+                error_message="Failed to copy original driver package source to USB",
+                accept_exit_codes={0, 1, 2, 3, 4, 5, 6, 7},
+                on_output_line=lambda line: write_command_output(
+                    line=line,
+                    percent=48,
+                    prefix="Source package copy: ",
+                    on_progress=on_progress,
+                    robocopy_only=True,
+                ),
+            )
+
+        write_stage(
+            percent=49,
+            message="Driver load path during Windows Setup: USB\\MateBook-Drivers",
+            on_progress=on_progress,
         )
 
         sources_path = Path(destination_root) / "sources"
@@ -867,7 +1233,7 @@ def invoke_usb_creation(
         add_drivers_to_wim(
             wim_path=str(boot_wim),
             indexes=[boot_target_index],
-            drivers_path=str(drivers_root),
+            drivers_path=str(effective_drivers_root),
             mount_dir=str(mount_dir),
             start_percent=70,
             end_percent=80,
@@ -886,7 +1252,7 @@ def invoke_usb_creation(
         add_drivers_to_wim(
             wim_path=str(install_wim),
             indexes=install_indexes,
-            drivers_path=str(drivers_root),
+            drivers_path=str(effective_drivers_root),
             mount_dir=str(mount_dir),
             start_percent=80,
             end_percent=97,
@@ -912,6 +1278,7 @@ def invoke_usb_creation(
             )
 
         write_stage(percent=100, message="Completed successfully.", on_progress=on_progress)
+        log_info("USB creation completed successfully.")
     finally:
         if mounted_iso:
             try:
@@ -924,7 +1291,15 @@ def invoke_usb_creation(
         except Exception:
             pass
 
+        if extracted_drivers_root and extracted_drivers_root.exists():
+            shutil.rmtree(extracted_drivers_root, ignore_errors=True)
+        if extracted_installers_root and extracted_installers_root.exists():
+            shutil.rmtree(extracted_installers_root, ignore_errors=True)
+        if exported_online_drivers_root and exported_online_drivers_root.exists():
+            shutil.rmtree(exported_online_drivers_root, ignore_errors=True)
+
         shutil.rmtree(work_root, ignore_errors=True)
+        log_info("USB creation cleanup finished.")
 
 
 class MateBookUsbCreatorApp:
@@ -985,7 +1360,7 @@ class MateBookUsbCreatorApp:
         self.btn_start = ttk.Button(content, text="Create Bootable USB", command=self.start_creation)
         self.btn_start.grid(row=6, column=0, sticky="ew")
 
-        self.progress = ttk.Progressbar(content, mode="determinate", minimum=0, maximum=100)
+        self.progress = ttk.Progressbar(content, mode="determinate", maximum=100)
         self.progress.grid(row=7, column=0, sticky="ew", pady=(10, 6))
 
         self.lbl_status = ttk.Label(content, textvariable=self.status_var)
@@ -1100,14 +1475,20 @@ class MateBookUsbCreatorApp:
             self.ui_queue.put(("progress", int(percent), str(message)))
 
         try:
+            log_info(
+                "Worker thread started. "
+                f"iso_path={iso_path} drivers_path={drivers_path} drive_letter={drive_letter}"
+            )
             invoke_usb_creation(
                 iso_path=iso_path,
                 drivers_path=drivers_path,
                 drive_letter=drive_letter,
                 on_progress=progress_callback,
             )
+            log_info("Worker thread finished successfully.")
             self.ui_queue.put(("success",))
         except Exception as exc:
+            log_exception("Worker thread failed.")
             self.ui_queue.put(("error", str(exc), traceback.format_exc()))
         finally:
             self.ui_queue.put(("complete",))
@@ -1154,22 +1535,49 @@ class MateBookUsbCreatorApp:
 
 
 def main() -> int:
+    configure_logging()
+    log_info(f"Process start. pid={os.getpid()} argv={sys.argv!r} cwd={os.getcwd()} exe={sys.executable}")
+
     if os.name != "nt":
+        log_info("Unsupported OS. Windows is required.")
         print("This tool is supported on Windows only.", file=sys.stderr)
         return 1
 
-    if not is_user_admin():
+    if TK_IMPORT_ERROR is not None:
+        log_exception("Tkinter import failed.")
+        show_startup_error(
+            "Python Tkinter is not available.\n\n"
+            f"Install Tk support for your Python environment.\n\nDetails: {TK_IMPORT_ERROR}\n\n"
+            f"Log file: {LOG_PATH}"
+        )
+        return 1
+
+    admin_state = is_user_admin()
+    log_info(f"Administrative privileges detected: {admin_state}")
+    if not admin_state:
         try:
             relaunch_as_admin()
         except Exception as exc:
+            log_exception("Elevation request failed.")
             print(str(exc), file=sys.stderr)
             return 1
+        log_info("Elevation requested successfully. Exiting unelevated parent process.")
         return 0
 
-    root = Tk()
-    MateBookUsbCreatorApp(root)
-    root.mainloop()
-    return 0
+    try:
+        root = Tk()
+        MateBookUsbCreatorApp(root)
+        log_info("GUI created successfully. Entering Tk main loop.")
+        root.mainloop()
+        log_info("Tk main loop exited normally.")
+        return 0
+    except Exception:
+        log_exception("Fatal startup/runtime error in GUI.")
+        show_startup_error(
+            "MateBook Win11 USB Creator failed to start.\n\n"
+            f"Check log file:\n{LOG_PATH}"
+        )
+        return 1
 
 
 if __name__ == "__main__":

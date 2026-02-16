@@ -259,6 +259,26 @@ def parse_json_output(output_lines: list[str]) -> object:
     return json.loads(payload)
 
 
+def clear_readonly_attributes(*, paths: list[Path], on_progress: callable | None, percent: int) -> None:
+    existing_files = [path for path in paths if path.exists()]
+    if not existing_files:
+        return
+
+    write_stage(
+        percent=percent,
+        message="Clearing read-only attributes on setup image files...",
+        on_progress=on_progress,
+    )
+
+    for path in existing_files:
+        run_command(
+            "attrib.exe",
+            ["-R", str(path)],
+            error_message=f"Failed to clear read-only attribute: {path}",
+        )
+        write_stage(percent=percent, message=f"Writable image file: {path}", on_progress=on_progress)
+
+
 def write_stage(*, percent: int, message: str, on_progress: callable | None) -> None:
     bounded = max(0, min(100, int(percent)))
     if on_progress:
@@ -1201,6 +1221,12 @@ def invoke_usb_creation(
         install_wim = sources_path / "install.wim"
         install_esd = sources_path / "install.esd"
 
+        clear_readonly_attributes(
+            paths=[boot_wim, install_wim, install_esd],
+            on_progress=on_progress,
+            percent=52,
+        )
+
         if not boot_wim.exists():
             raise RuntimeError(f"boot.wim not found on USB at {boot_wim}")
 
@@ -1217,6 +1243,11 @@ def invoke_usb_creation(
                     start_percent=55,
                     end_percent=70,
                     on_progress=on_progress,
+                )
+                clear_readonly_attributes(
+                    paths=[install_wim],
+                    on_progress=on_progress,
+                    percent=70,
                 )
             else:
                 raise RuntimeError(f"Neither install.wim nor install.esd found under {sources_path}")

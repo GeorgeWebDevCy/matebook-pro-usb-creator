@@ -246,6 +246,163 @@ function Get-WimIndexes {
     return $indexes
 }
 
+function Get-DriverRepositoryInfFiles {
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriversPath
+    )
+
+    if (-not (Test-Path -LiteralPath $DriversPath)) {
+        throw "Driver folder not found: $DriversPath"
+    }
+
+    $resolvedRoot = (Resolve-Path -LiteralPath $DriversPath -ErrorAction Stop).Path
+    $rootWithSeparator = $resolvedRoot.TrimEnd("\") + "\"
+
+    $driverInfFiles = @(Get-ChildItem -LiteralPath $resolvedRoot -Recurse -File -Filter "*.inf" -ErrorAction Stop | Sort-Object FullName)
+    $entries = @()
+    foreach ($file in $driverInfFiles) {
+        $relativePath = if ($file.FullName.StartsWith($rootWithSeparator, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $file.FullName.Substring($rootWithSeparator.Length)
+        }
+        else {
+            $file.Name
+        }
+
+        $entries += [PSCustomObject]@{
+            RelativePath = $relativePath
+            FullPath     = $file.FullName
+        }
+    }
+
+    return $entries
+}
+
+function Get-WifiDriverPackages {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$DriverPackages
+    )
+
+    $wifiPackages = @()
+    foreach ($driverPackage in $DriverPackages) {
+        $infContent = ""
+        try {
+            $infContent = Get-Content -LiteralPath $driverPackage.FullPath -Raw -ErrorAction Stop
+        }
+        catch {
+            continue
+        }
+
+        if (-not $infContent) {
+            continue
+        }
+
+        $isNetworkClass = $false
+        if ($infContent -match "(?im)^\s*Class\s*=\s*Net\s*$") {
+            $isNetworkClass = $true
+        }
+        elseif ($infContent -match "(?im)^\s*ClassGuid\s*=\s*\{4d36e972-e325-11ce-bfc1-08002be10318\}\s*$") {
+            $isNetworkClass = $true
+        }
+
+        if (-not $isNetworkClass) {
+            continue
+        }
+
+        $fileName = [System.IO.Path]::GetFileName($driverPackage.FullPath)
+        $hasWirelessMarker = $false
+        if ($infContent -match "(?i)\b(wi-?fi|wlan|wireless|802\.11)\b") {
+            $hasWirelessMarker = $true
+        }
+        elseif ($fileName -match "(?i)(wifi|wlan|wireless|80211|netwtw|rtwl|athw|mtkwl|qcwlan)") {
+            $hasWirelessMarker = $true
+        }
+
+        if (-not $hasWirelessMarker) {
+            continue
+        }
+
+        $wifiPackages += [PSCustomObject]@{
+            RelativePath = $driverPackage.RelativePath
+            FullPath     = $driverPackage.FullPath
+            FileName     = $fileName
+        }
+    }
+
+    return @($wifiPackages | Sort-Object FileName, RelativePath -Unique)
+}
+
+function Get-ImageThirdPartyDrivers {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ImagePath
+    )
+
+    $result = Invoke-ExternalCommand -FilePath "dism.exe" `
+        -Arguments @("/English", "/Image:$ImagePath", "/Get-Drivers") `
+        -ErrorMessage "Unable to list third-party drivers in mounted image: $ImagePath"
+
+    $drivers = @()
+    $current = $null
+
+    foreach ($line in $result.Output) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        if ($line -match "^\s*Published Name\s*:\s*(.+)$") {
+            if ($current) {
+                $drivers += [PSCustomObject]$current
+            }
+            $current = [ordered]@{
+                PublishedName    = $Matches[1].Trim()
+                OriginalFileName = ""
+                ProviderName     = ""
+                ClassName        = ""
+                Date             = ""
+                Version          = ""
+            }
+            continue
+        }
+
+        if (-not $current) {
+            continue
+        }
+
+        if ($line -match "^\s*Original File Name\s*:\s*(.+)$") {
+            $current.OriginalFileName = $Matches[1].Trim()
+            continue
+        }
+
+        if ($line -match "^\s*Provider Name\s*:\s*(.+)$") {
+            $current.ProviderName = $Matches[1].Trim()
+            continue
+        }
+
+        if ($line -match "^\s*Class Name\s*:\s*(.+)$") {
+            $current.ClassName = $Matches[1].Trim()
+            continue
+        }
+
+        if ($line -match "^\s*Date\s*:\s*(.+)$") {
+            $current.Date = $Matches[1].Trim()
+            continue
+        }
+
+        if ($line -match "^\s*Version\s*:\s*(.+)$") {
+            $current.Version = $Matches[1].Trim()
+            continue
+        }
+    }
+
+    if ($current) {
+        $drivers += [PSCustomObject]$current
+    }
+
+    return $drivers
+}
+
 function Add-DriversToWim {
     param(
         [Parameter(Mandatory)]
@@ -262,8 +419,28 @@ function Add-DriversToWim {
         [int]$EndPercent,
         [Parameter(Mandatory)]
         [string]$Label,
+        [string[]]$RequiredOriginalInfNames = @(),
+        [string]$RequiredOriginalInfLabel = "required",
         [scriptblock]$OnProgress
     )
+
+    $driverPackages = Get-DriverRepositoryInfFiles -DriversPath $DriversPath
+    if ($driverPackages.Count -eq 0) {
+        throw "No .inf driver packages found under: $DriversPath"
+    }
+
+    Write-Stage -Percent $StartPercent -Message ("{0}: discovered {1} INF packages in driver repository." -f $Label, $driverPackages.Count) -OnProgress $OnProgress
+    $driverCounter = 0
+    foreach ($driverPackage in $driverPackages) {
+        $driverCounter++
+        Write-Stage -Percent $StartPercent -Message ("{0}: package [{1}/{2}] {3}" -f $Label, $driverCounter, $driverPackages.Count, $driverPackage.RelativePath) -OnProgress $OnProgress
+    }
+
+    $requiredInfNames = @($RequiredOriginalInfNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() } | Sort-Object -Unique)
+    $requiredInfNameLookup = @{}
+    foreach ($requiredInfName in $requiredInfNames) {
+        $requiredInfNameLookup[$requiredInfName.ToLowerInvariant()] = $requiredInfName
+    }
 
     $count = [Math]::Max(1, $Indexes.Count)
     $range = [Math]::Max(1, $EndPercent - $StartPercent)
@@ -288,6 +465,15 @@ function Add-DriversToWim {
                 -OnOutputLine $mountOutput | Out-Null
             $mounted = $true
 
+            $beforeDrivers = Get-ImageThirdPartyDrivers -ImagePath $MountDir
+            $beforePublishedNames = @{}
+            foreach ($beforeDriver in $beforeDrivers) {
+                if (-not [string]::IsNullOrWhiteSpace($beforeDriver.PublishedName)) {
+                    $beforePublishedNames[$beforeDriver.PublishedName.ToLowerInvariant()] = $true
+                }
+            }
+            Write-Stage -Percent $beforePercent -Message ("{0}[{1}] third-party drivers before add: {2}" -f $Label, $index, $beforeDrivers.Count) -OnProgress $OnProgress
+
             Write-Stage -Percent $beforePercent -Message "${Label}: injecting drivers into index $index..." -OnProgress $OnProgress
             $addDriverOutput = {
                 param($line)
@@ -297,6 +483,65 @@ function Add-DriversToWim {
                 -Arguments @("/Image:$MountDir", "/Add-Driver", "/Driver:$DriversPath", "/Recurse") `
                 -ErrorMessage "$Label index $index driver injection failed" `
                 -OnOutputLine $addDriverOutput | Out-Null
+
+            $afterDrivers = Get-ImageThirdPartyDrivers -ImagePath $MountDir
+            $addedDrivers = @()
+            foreach ($afterDriver in $afterDrivers) {
+                if ([string]::IsNullOrWhiteSpace($afterDriver.PublishedName)) {
+                    continue
+                }
+
+                $publishedKey = $afterDriver.PublishedName.ToLowerInvariant()
+                if (-not $beforePublishedNames.ContainsKey($publishedKey)) {
+                    $addedDrivers += $afterDriver
+                }
+            }
+
+            Write-Stage -Percent $beforePercent -Message ("{0}[{1}] third-party drivers after add: {2}" -f $Label, $index, $afterDrivers.Count) -OnProgress $OnProgress
+            $uniqueAddedDrivers = $addedDrivers | Sort-Object PublishedName -Unique
+            Write-Stage -Percent $beforePercent -Message ("{0}[{1}] newly added drivers: {2}" -f $Label, $index, $uniqueAddedDrivers.Count) -OnProgress $OnProgress
+            if ($addedDrivers.Count -gt 0) {
+                foreach ($addedDriver in ($uniqueAddedDrivers | Sort-Object OriginalFileName, ProviderName, PublishedName)) {
+                    $driverLine = "{0}[{1}] added driver: {2} | Provider={3} | Class={4} | Published={5}" -f `
+                        $Label, `
+                        $index, `
+                        $(if ($addedDriver.OriginalFileName) { $addedDriver.OriginalFileName } else { "<unknown>" }), `
+                        $(if ($addedDriver.ProviderName) { $addedDriver.ProviderName } else { "<unknown>" }), `
+                        $(if ($addedDriver.ClassName) { $addedDriver.ClassName } else { "<unknown>" }), `
+                        $addedDriver.PublishedName
+                    Write-Stage -Percent $beforePercent -Message $driverLine -OnProgress $OnProgress
+                }
+            }
+
+            if ($requiredInfNameLookup.Count -gt 0) {
+                $matchedRequiredInfNames = @()
+                foreach ($afterDriver in $afterDrivers) {
+                    if ([string]::IsNullOrWhiteSpace($afterDriver.OriginalFileName)) {
+                        continue
+                    }
+
+                    $candidateInfName = $afterDriver.OriginalFileName.Trim()
+                    if ($requiredInfNameLookup.ContainsKey($candidateInfName.ToLowerInvariant())) {
+                        $matchedRequiredInfNames += $candidateInfName
+                    }
+                }
+
+                $uniqueMatchedRequiredInfNames = @($matchedRequiredInfNames | Sort-Object -Unique)
+                Write-Stage -Percent $beforePercent -Message ("{0}[{1}] detected {2} {3} driver(s) in mounted image." -f $Label, $index, $uniqueMatchedRequiredInfNames.Count, $RequiredOriginalInfLabel) -OnProgress $OnProgress
+                foreach ($matchedRequiredInfName in $uniqueMatchedRequiredInfNames) {
+                    Write-Stage -Percent $beforePercent -Message ("{0}[{1}] confirmed {2} driver: {3}" -f $Label, $index, $RequiredOriginalInfLabel, $matchedRequiredInfName) -OnProgress $OnProgress
+                }
+
+                if ($uniqueMatchedRequiredInfNames.Count -eq 0) {
+                    $expectedList = @($requiredInfNames | Select-Object -First 12)
+                    $expectedListText = $expectedList -join ", "
+                    if ($requiredInfNames.Count -gt $expectedList.Count) {
+                        $expectedListText += ", ..."
+                    }
+
+                    throw ("{0} index {1} does not contain any {2} driver after injection. Expected one of: {3}" -f $Label, $index, $RequiredOriginalInfLabel, $expectedListText)
+                }
+            }
 
             Write-Stage -Percent $beforePercent -Message "${Label}: committing index $index..." -OnProgress $OnProgress
             $commitOutput = {
@@ -388,6 +633,7 @@ function Invoke-UsbCreation {
     $targetDrive = $DriveLetter.ToUpper().TrimEnd(":")
     $destinationRoot = "$targetDrive`:\"
     $mountedIso = $false
+    $wifiInfFileNames = @()
     $workRoot = Join-Path -Path $env:TEMP -ChildPath ("MateBookUsbCreator_" + [Guid]::NewGuid().ToString("N"))
     $mountDir = Join-Path -Path $workRoot -ChildPath "Mount"
     New-Item -ItemType Directory -Path $mountDir -Force | Out-Null
@@ -403,6 +649,22 @@ function Invoke-UsbCreation {
         }
         if ($targetDrive -eq $env:SystemDrive.TrimEnd(":")) {
             throw "Selected drive is the system drive. Select a USB drive."
+        }
+
+        $repositoryInfPackages = Get-DriverRepositoryInfFiles -DriversPath $DriversPath
+        if ($repositoryInfPackages.Count -eq 0) {
+            throw "No .inf driver packages found under: $DriversPath"
+        }
+
+        $wifiDriverPackages = Get-WifiDriverPackages -DriverPackages $repositoryInfPackages
+        if ($wifiDriverPackages.Count -eq 0) {
+            throw "No Wi-Fi INF drivers were detected in: $DriversPath. Add Wi-Fi drivers and retry."
+        }
+
+        $wifiInfFileNames = @($wifiDriverPackages | ForEach-Object { $_.FileName } | Sort-Object -Unique)
+        Write-Stage -Percent 5 -Message ("Detected {0} Wi-Fi INF package(s)." -f $wifiInfFileNames.Count) -OnProgress $OnProgress
+        foreach ($wifiDriverPackage in $wifiDriverPackages) {
+            Write-Stage -Percent 5 -Message ("Wi-Fi package: {0}" -f $wifiDriverPackage.RelativePath) -OnProgress $OnProgress
         }
 
         $partition = Get-Partition -DriveLetter $targetDrive -ErrorAction Stop
@@ -476,11 +738,11 @@ function Invoke-UsbCreation {
         $bootIndexes = Get-WimIndexes -WimPath $bootWim
         $bootTargetIndex = if ($bootIndexes -contains 2) { 2 } else { $bootIndexes[0] }
         Write-Stage -Percent 70 -Message "Injecting drivers into boot.wim index $bootTargetIndex..." -OnProgress $OnProgress
-        Add-DriversToWim -WimPath $bootWim -Indexes @($bootTargetIndex) -DriversPath $DriversPath -MountDir $mountDir -StartPercent 70 -EndPercent 80 -Label "boot.wim" -OnProgress $OnProgress
+        Add-DriversToWim -WimPath $bootWim -Indexes @($bootTargetIndex) -DriversPath $DriversPath -MountDir $mountDir -StartPercent 70 -EndPercent 80 -Label "boot.wim" -RequiredOriginalInfNames $wifiInfFileNames -RequiredOriginalInfLabel "Wi-Fi" -OnProgress $OnProgress
 
         $installIndexes = Get-WimIndexes -WimPath $installWim
         Write-Stage -Percent 80 -Message ("Injecting drivers into install.wim indexes: {0}" -f ($installIndexes -join ", ")) -OnProgress $OnProgress
-        Add-DriversToWim -WimPath $installWim -Indexes $installIndexes -DriversPath $DriversPath -MountDir $mountDir -StartPercent 80 -EndPercent 97 -Label "install.wim" -OnProgress $OnProgress
+        Add-DriversToWim -WimPath $installWim -Indexes $installIndexes -DriversPath $DriversPath -MountDir $mountDir -StartPercent 80 -EndPercent 97 -Label "install.wim" -RequiredOriginalInfNames $wifiInfFileNames -RequiredOriginalInfLabel "Wi-Fi" -OnProgress $OnProgress
 
         $bootsectPath = Join-Path -Path $isoRoot -ChildPath "boot\bootsect.exe"
         if (Test-Path -LiteralPath $bootsectPath) {

@@ -139,6 +139,8 @@ function Invoke-ExternalCommand {
 function Write-CommandOutput {
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [AllowNull()]
         [string]$Line,
         [Parameter(Mandatory)]
         [int]$Percent,

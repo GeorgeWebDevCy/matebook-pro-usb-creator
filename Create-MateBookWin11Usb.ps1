@@ -563,7 +563,7 @@ function Update-UiProgress {
 }
 
 $btnStart.Add_Click({
-        if ($worker.IsBusy) {
+        if ($script:isRunning) {
             return
         }
 
@@ -605,17 +605,45 @@ $btnStart.Add_Click({
         $btnRefreshUsb.Enabled = $false
         $cmbUsb.Enabled = $false
 
-        $inputData = [PSCustomObject]@{
-            IsoPath     = $isoPath
-            DriversPath = $driversPath
-            DriveLetter = $driveLetter
-        }
+        $script:isRunning = $true
+        try {
+            $progressCallback = {
+                param($percent, $message)
+                Update-UiProgress -Percent ([int]$percent) -Message ([string]$message
+                )
+            }
 
-        $worker.RunWorkerAsync($inputData)
+            Invoke-UsbCreation -IsoPath $isoPath -DriversPath $driversPath -DriveLetter $driveLetter -OnProgress $progressCallback
+            $lblStatus.Text = "Done"
+            [System.Windows.Forms.MessageBox]::Show(
+                "Bootable USB has been created successfully.",
+                "MateBook Win11 USB Creator",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+        }
+        catch {
+            $lblStatus.Text = "Failed"
+            $txtLog.AppendText("`r`nERROR: $($_.Exception.Message)`r`n")
+            [System.Windows.Forms.MessageBox]::Show(
+                "USB creation failed.`r`n`r`n$($_.Exception.Message)",
+                "MateBook Win11 USB Creator",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+        }
+        finally {
+            $btnStart.Enabled = $true
+            $btnBrowseIso.Enabled = $true
+            $btnBrowseDrivers.Enabled = $true
+            $btnRefreshUsb.Enabled = $true
+            $cmbUsb.Enabled = $true
+            $script:isRunning = $false
+        }
     })
 
 $form.add_FormClosing({
-        if ($worker.IsBusy) {
+        if ($script:isRunning) {
             [System.Windows.Forms.MessageBox]::Show(
                 "USB creation is currently running. Wait for completion before closing.",
                 "Operation in progress",

@@ -70,6 +70,7 @@ class DriverResolution:
     wifi_packages: list[DriverPackage]
     extracted_drivers_root: Path | None
     extracted_installers_root: Path | None
+    staged_drivers_root: Path | None
     source_description: str
 
 
@@ -516,6 +517,7 @@ def extract_driver_installers_with_7zip(
     processed: set[str] = set()
     extracted_count = 0
     failed_count = 0
+    extraction_sequence = 0
 
     while queue:
         archive_path, depth = queue.pop(0)
@@ -532,7 +534,8 @@ def extract_driver_installers_with_7zip(
         except ValueError:
             relative_archive = archive_path.relative_to(extraction_root)
 
-        destination_folder = extraction_root / relative_archive.parent / f"{archive_path.stem}_x"
+        extraction_sequence += 1
+        destination_folder = extraction_root / f"x{depth:02d}_{extraction_sequence:05d}"
         destination_folder.mkdir(parents=True, exist_ok=True)
 
         write_stage(
@@ -586,6 +589,92 @@ def extract_driver_installers_with_7zip(
     return extraction_root
 
 
+def stage_driver_repository_for_dism(
+    *,
+    driver_packages: list[DriverPackage],
+    on_progress: callable | None,
+    percent: int,
+) -> tuple[Path, list[DriverPackage]]:
+    source_dirs: list[Path] = []
+    seen_dirs: set[str] = set()
+    for package in driver_packages:
+        source_dir = Path(package.full_path).parent
+        source_key = str(source_dir).lower()
+        if source_key in seen_dirs:
+            continue
+        seen_dirs.add(source_key)
+        source_dirs.append(source_dir)
+
+    if not source_dirs:
+        raise RuntimeError("No driver package folders were found to stage.")
+
+    staged_root = Path(tempfile.mkdtemp(prefix="MateBookDriverStage_"))
+    write_stage(
+        percent=percent,
+        message=(
+            f"Staging {len(source_dirs)} driver package folder(s) into short paths "
+            "for DISM compatibility..."
+        ),
+        on_progress=on_progress,
+    )
+    log_info(f"Staging driver folders for DISM into short path root: {staged_root}")
+
+    for index, source_dir in enumerate(source_dirs, start=1):
+        target_dir = staged_root / f"pkg_{index:04d}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        write_stage(
+            percent=percent,
+            message=f"Short-path staging [{index}/{len(source_dirs)}]: {source_dir.name}",
+            on_progress=on_progress,
+        )
+
+        run_command(
+            "robocopy.exe",
+            [
+                str(source_dir),
+                str(target_dir),
+                "*.*",
+                "/E",
+                "/R:1",
+                "/W:1",
+                "/COPY:DAT",
+                "/DCOPY:DAT",
+                "/NFL",
+                "/NDL",
+                "/NP",
+            ],
+            error_message=f"Failed to stage driver package folder: {source_dir}",
+            accept_exit_codes={0, 1, 2, 3, 4, 5, 6, 7},
+            on_output_line=lambda line: write_command_output(
+                line=line,
+                percent=percent,
+                prefix="Short-path stage: ",
+                on_progress=on_progress,
+                robocopy_only=True,
+            ),
+        )
+
+    staged_packages = get_driver_repository_inf_files(str(staged_root))
+    if not staged_packages:
+        raise RuntimeError(
+            "Short-path staging finished but no INF files were found in the staged repository."
+        )
+
+    write_stage(
+        percent=percent,
+        message=(
+            f"Short-path staging complete. Staged INF packages: {len(staged_packages)}. "
+            f"Root: {staged_root}"
+        ),
+        on_progress=on_progress,
+    )
+    log_info(
+        f"Short-path staging complete. source_dirs={len(source_dirs)} "
+        f"staged_inf={len(staged_packages)} root={staged_root}"
+    )
+    return staged_root, staged_packages
+
+
 def resolve_driver_source(
     *,
     drivers_root: Path,
@@ -594,6 +683,7 @@ def resolve_driver_source(
     effective_drivers_root = drivers_root
     extracted_drivers_root: Path | None = None
     extracted_installers_root: Path | None = None
+    staged_drivers_root: Path | None = None
     source_description = "direct folder INF scan"
 
     repository_packages = get_driver_repository_inf_files(str(effective_drivers_root))
@@ -641,9 +731,19 @@ def resolve_driver_source(
             f"Top file types: {extension_summary}"
         )
 
+    # DISM frequently fails on deep extraction paths (>260 chars). Stage each INF
+    # package folder into a compact short-path repository before any injection.
+    staged_drivers_root, repository_packages = stage_driver_repository_for_dism(
+        driver_packages=repository_packages,
+        on_progress=on_progress,
+        percent=5,
+    )
+    effective_drivers_root = staged_drivers_root
+    source_description += " + short-path staging"
+
     wifi_packages = get_wifi_driver_packages(repository_packages)
     write_stage(
-        percent=5,
+        percent=6,
         message=(
             f"Driver source resolved ({source_description}). "
             f"INF packages discovered: {len(repository_packages)}."
@@ -657,6 +757,7 @@ def resolve_driver_source(
         wifi_packages=wifi_packages,
         extracted_drivers_root=extracted_drivers_root,
         extracted_installers_root=extracted_installers_root,
+        staged_drivers_root=staged_drivers_root,
         source_description=source_description,
     )
 
@@ -669,6 +770,8 @@ def cleanup_driver_resolution(resolution: DriverResolution | None) -> None:
         shutil.rmtree(resolution.extracted_drivers_root, ignore_errors=True)
     if resolution.extracted_installers_root and resolution.extracted_installers_root.exists():
         shutil.rmtree(resolution.extracted_installers_root, ignore_errors=True)
+    if resolution.staged_drivers_root and resolution.staged_drivers_root.exists():
+        shutil.rmtree(resolution.staged_drivers_root, ignore_errors=True)
 
 
 def analyze_driver_source(
@@ -840,6 +943,82 @@ def clear_directory(path: str) -> None:
                 pass
 
 
+def mount_wim_image_with_recovery(
+    *,
+    wim_path: str,
+    image_index: int,
+    mount_dir: str,
+    label: str,
+    percent: int,
+    on_progress: callable | None,
+) -> None:
+    mount_arguments = ["/Mount-Image", f"/ImageFile:{wim_path}", f"/Index:{image_index}", f"/MountDir:{mount_dir}"]
+
+    def run_mount() -> None:
+        run_command(
+            "dism.exe",
+            mount_arguments,
+            error_message=f"{label} index {image_index} mount failed",
+            on_output_line=lambda line: write_command_output(
+                line=line,
+                percent=percent,
+                prefix=f"{label}[{image_index}] ",
+                on_progress=on_progress,
+            ),
+        )
+
+    try:
+        run_mount()
+        return
+    except Exception as mount_error:
+        mount_error_text = str(mount_error).lower()
+        mount_conflict = "0xc1420127" in mount_error_text or "already mounted for read/write access" in mount_error_text
+        if not mount_conflict:
+            raise
+
+    write_stage(
+        percent=percent,
+        message=(
+            f"{label}[{image_index}] DISM mount conflict detected (0xc1420127). "
+            "Running mounted-image cleanup and retrying..."
+        ),
+        on_progress=on_progress,
+    )
+    log_info(
+        f"{label} index {image_index} encountered 0xc1420127 mount conflict. "
+        "Attempting /Unmount-Image /Discard and /Cleanup-Wim before retry."
+    )
+
+    cleanup_commands = [
+        (
+            ["/Unmount-Image", f"/MountDir:{mount_dir}", "/Discard"],
+            f"{label} index {image_index} stale mount discard",
+        ),
+        (
+            ["/Cleanup-Wim"],
+            f"{label} index {image_index} cleanup-wim",
+        ),
+    ]
+    for cleanup_args, cleanup_label in cleanup_commands:
+        try:
+            run_command(
+                "dism.exe",
+                cleanup_args,
+                error_message=f"{cleanup_label} failed",
+                on_output_line=lambda line: write_command_output(
+                    line=line,
+                    percent=percent,
+                    prefix=f"{label}[{image_index}] recovery ",
+                    on_progress=on_progress,
+                ),
+            )
+        except Exception as cleanup_error:
+            log_info(f"{cleanup_label} encountered non-fatal error during recovery: {cleanup_error}")
+
+    clear_directory(mount_dir)
+    run_mount()
+
+
 def add_drivers_to_wim(
     *,
     wim_path: str,
@@ -886,16 +1065,13 @@ def add_drivers_to_wim(
         clear_directory(mount_dir)
         mounted = False
         try:
-            run_command(
-                "dism.exe",
-                ["/Mount-Image", f"/ImageFile:{wim_path}", f"/Index:{image_index}", f"/MountDir:{mount_dir}"],
-                error_message=f"{label} index {image_index} mount failed",
-                on_output_line=lambda line: write_command_output(
-                    line=line,
-                    percent=before_percent,
-                    prefix=f"{label}[{image_index}] ",
-                    on_progress=on_progress,
-                ),
+            mount_wim_image_with_recovery(
+                wim_path=wim_path,
+                image_index=image_index,
+                mount_dir=mount_dir,
+                label=label,
+                percent=before_percent,
+                on_progress=on_progress,
             )
             mounted = True
 
@@ -917,7 +1093,7 @@ def add_drivers_to_wim(
                 "dism.exe",
                 [f"/Image:{mount_dir}", "/Add-Driver", f"/Driver:{drivers_path}", "/Recurse"],
                 error_message=f"{label} index {image_index} driver injection failed",
-                accept_exit_codes={0, 2},
+                accept_exit_codes={0, 2, 50},
                 on_output_line=lambda line: write_command_output(
                     line=line,
                     percent=before_percent,
@@ -936,6 +1112,19 @@ def add_drivers_to_wim(
                 )
                 log_info(
                     f"{label} index {image_index} Add-Driver returned exit code 2; continuing with partial success."
+                )
+            elif add_driver_result.exit_code == 50:
+                write_stage(
+                    percent=before_percent,
+                    message=(
+                        f"{label}[{image_index}] DISM reported unsigned/unsupported package errors (exit code 50). "
+                        "Continuing with successfully installed drivers."
+                    ),
+                    on_progress=on_progress,
+                )
+                log_info(
+                    f"{label} index {image_index} Add-Driver returned exit code 50; "
+                    "continuing with partial success."
                 )
 
             after_drivers = get_image_third_party_drivers(mount_dir)
